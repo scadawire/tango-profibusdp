@@ -1,4 +1,4 @@
-# tango-saphana
+# tango-profibusdp
 
 scadawire/tango-controls integration to Profibus Dp Servers
 
