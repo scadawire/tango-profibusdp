@@ -1,0 +1,2 @@
+pytango==9.3.2
+pyprofibus==1.13
