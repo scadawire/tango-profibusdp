@@ -100,11 +100,11 @@ class ProfibusDp(Device, metaclass=DeviceMeta):
                 self._master.addSlave(slaveDesc)
 
             self._master.initialize()
-            self.info_stream("Connected to Profibus DP master on " + self.serial_port)
+            self.info_stream("Connected to Profibus DP master on %s", self.serial_port)
 
         except Exception as e:
             self.last_error = str(e)
-            self.error_stream(traceback.format_exc())
+            self.error_stream("%s", traceback.format_exc())
             self.set_state(DevState.FAULT)
 
     # ───────────── Poll Loop ─────────────
@@ -113,7 +113,7 @@ class ProfibusDp(Device, metaclass=DeviceMeta):
             try:
                 self._run_cycle()
             except Exception as e:
-                self.warn_stream("poll error: " + str(e))
+                self.warn_stream("poll error: %s", str(e))
             self._stop_event.wait(timeout=self.cycle_time)
 
     def _run_cycle(self):
