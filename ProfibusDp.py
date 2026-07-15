@@ -197,6 +197,7 @@ class ProfibusDp(Device, metaclass=DeviceMeta):
         }
         self.dynamicAttributes[name] = 0
         self.add_attribute(attr, r_meth=self.read_dynamic_attr, w_meth=self.write_dynamic_attr)
+        self.set_change_event(name, True, False)
 
     # ───────────── Attribute Access ─────────────
     def read_dynamic_attr(self, attr):
@@ -227,6 +228,7 @@ class ProfibusDp(Device, metaclass=DeviceMeta):
             self._write_array(lookup, flat)
         else:
             self._write_scalar(lookup, value)
+        self.push_change_event(name, value)
 
     def _read_scalar(self, lookup):
         slave_addr = lookup["slave_addr"]

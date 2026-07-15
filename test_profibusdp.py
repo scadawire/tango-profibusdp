@@ -58,6 +58,8 @@ class State:
     def debug_stream(self, msg, *args): msg % args
     def warn_stream(self, msg, *args): msg % args
     def error_stream(self, msg, *args): msg % args
+    def set_change_event(self, name, implemented, detect=False): pass
+    def push_change_event(self, name, *args): pass
 
     def __getattr__(self, name):
         attr = getattr(ProfibusDp, name, None)
