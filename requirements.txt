@@ -1,2 +1,5 @@
 pytango==9.3.2
 pyprofibus==1.13
+# pyprofibus declares no dependencies of its own, but its serial phy (the
+# default one, phy_type=serial) imports pyserial
+pyserial==3.5

@@ -2,7 +2,9 @@
 
 import os
 import json
+import shutil
 import struct
+import tempfile
 import traceback
 import threading
 from tango import AttrWriteType, AttrDataFormat, DevState, Attr, SpectrumAttr, ImageAttr, CmdArgType, UserDefaultAttrProp
@@ -14,10 +16,29 @@ from tango.server import Device, attribute, command, DeviceMeta, device_property
 class ProfibusDp(Device, metaclass=DeviceMeta):
 
     # ───────────── Device Properties ─────────────
+    # Which CP-PHY carries the bus: "serial" (CpPhySerial on serial_port),
+    # "dummy_slave" (CpPhyDummySlave, an in-process slave that echoes every
+    # DataExchange byte XOR 0xFF - used by the SITL test) or "fpga".
+    # The values are passed through to pyprofibus, see PbConf.makePhy().
+    phy_type = device_property(dtype=str, default_value="serial")
     serial_port = device_property(dtype=str, default_value="/dev/ttyUSB0")
     baudrate = device_property(dtype=int, default_value=19200)
     master_addr = device_property(dtype=int, default_value=2)
-    # JSON array: [{"addr": 8, "input_size": 4, "output_size": 4, "ident": 0}]
+    # JSON array, one entry per slave:
+    #   [{"addr": 8, "gsd_file": "#Profibus_DP\nGSD_Revision=1\n...",
+    #     "modules": ["dummy output module", "dummy input module"],
+    #     "input_size": 2, "output_size": 2}]
+    # gsd_file carries the CONTENT of the slave's gsd, not a path to it - the
+    # same way the canopen device server takes its eds_file.  Nobody can put a
+    # file on this machine: scadawire is configured over the web, so a path
+    # property would be unusable.  connect() writes the content out to a temp
+    # file only because pyprofibus parses a gsd from a filename and nothing else.
+    # A gsd is mandatory: pyprofibus derives the ident number, the Chk_Cfg data
+    # elements and the User_Prm_Data from it, and none of them can be recovered
+    # from sizes alone.  input_size/output_size are named from the SLAVE's point
+    # of view, as in the gsd and in pyprofibus - input_size is what the slave
+    # receives from us.  Optional per slave: name, sync_mode, freeze_mode,
+    # group_mask, watchdog_ms, diag_period.
     slave_configs = device_property(dtype=str, default_value="[]")
     cycle_time = device_property(dtype=float, default_value=0.01)
     init_dynamic_attributes = device_property(dtype=str, default_value="")
@@ -36,7 +57,7 @@ class ProfibusDp(Device, metaclass=DeviceMeta):
         self.last_error = ""
         self._master = None
 
-        self.connect()
+        connected = self.connect()
 
         if self.init_dynamic_attributes:
             try:
@@ -61,51 +82,128 @@ class ProfibusDp(Device, metaclass=DeviceMeta):
 
         self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._poll_thread.start()
-        self.set_state(DevState.ON)
+        # only claim ON when there is a master to be on: connect() puts us in FAULT when it fails,
+        # and setting ON here regardless would paper over it. The slave buffers are empty then, so
+        # the first attribute access is what would surface the failure, as a KeyError on the slave
+        # address rather than as the connection error it is.
+        if connected:
+            self.set_state(DevState.ON)
 
     def delete_device(self):
         if hasattr(self, "_stop_event"):
             self._stop_event.set()
 
     # ───────────── Connection ─────────────
+    # Everything is built from a rendered pyprofibus conf rather than by calling
+    # DpSlaveDesc/DPM1 directly.  That is not a detour: DpSlaveDesc(slaveConf)
+    # takes a PbConf slave section and nothing else, and the Set_Prm / Chk_Cfg
+    # telegrams it prepares are filled in by PbConf._SlaveConf.makeDpSlaveDesc()
+    # from the gsd.  Going through PbConf also buys the phy switch for free -
+    # PbConf.makePhy() dispatches on [PHY] type and sizes the dummy slave's echo
+    # from the slave configs.
+    # Returns whether a master was built and initialized, so init_device knows whether it may go ON.
     def connect(self):
         try:
-            from pyprofibus.phy_serial import CpPhySerial
-            from pyprofibus import DPM1
+            from pyprofibus import PbConf
 
-            phy = CpPhySerial(port=self.serial_port, debug=False)
-            phy.setConfig(baudrate=self.baudrate)
+            # The conf and the gsd of every slave only exist to be parsed: pyprofibus reads both
+            # from a filename, while the properties carry their content. fromFile() parses the gsd
+            # of every slave section eagerly, so once it returns nothing needs the directory again.
+            temp_dir = tempfile.mkdtemp(prefix="profibusdp-")
+            try:
+                pbConf = PbConf.fromFile(self.render_conf(temp_dir))
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
-            self._master = DPM1(
-                phy=phy,
-                masterAddr=self.master_addr,
-                debug=False,
-            )
+            self._master = pbConf.makeDPM()
 
-            for sc in json.loads(self.slave_configs):
-                addr = int(sc["addr"])
-                input_size = int(sc.get("input_size", 0))
-                output_size = int(sc.get("output_size", 0))
-                ident = int(sc.get("ident", 0))
-
-                slaveDesc = pyprofibus.DpSlaveDesc(
-                    identNumber=ident,
-                    slaveAddr=addr,
-                    inputSize=input_size,
-                    outputSize=output_size,
-                )
-                self._slave_input_data[addr] = bytearray(input_size)
-                self._slave_output_data[addr] = bytearray(output_size)
-                self._slave_descs[addr] = slaveDesc
+            for slaveConf in pbConf.slaveConfs:
+                slaveDesc = slaveConf.makeDpSlaveDesc()
                 self._master.addSlave(slaveDesc)
 
+                # pyprofibus names the sizes from the slave's point of view, we
+                # name our buffers from the master's: the slave's output is our
+                # input.  Getting this crossover wrong truncates silently, since
+                # _run_cycle slices the incoming data to the buffer length.
+                self._slave_descs[slaveConf.addr] = slaveDesc
+                self._slave_input_data[slaveConf.addr] = bytearray(slaveConf.outputSize)
+                self._slave_output_data[slaveConf.addr] = bytearray(slaveConf.inputSize)
+
             self._master.initialize()
-            self.info_stream("Connected to Profibus DP master on %s", self.serial_port)
+            self.info_stream(
+                "Connected to Profibus DP master, phy %s on %s",
+                self.phy_type, self.serial_port
+            )
+            return True
 
         except Exception as e:
             self.last_error = str(e)
             self.error_stream("%s", traceback.format_exc())
             self.set_state(DevState.FAULT)
+            return False
+
+    def render_conf(self, temp_dir):
+        """
+        Render the device properties into a pyprofibus conf file in temp_dir, next to the gsd of
+        every slave. Returns the path of the conf; the caller owns temp_dir and has to remove it.
+        """
+        lines = [
+            "[PROFIBUS]",
+            "debug=0",
+            "",
+            "[PHY]",
+            "type=%s" % self.phy_type,
+            "dev=%s" % self.serial_port,
+            "baud=%d" % self.baudrate,
+            "",
+            "[FDL]",
+            "",
+            "[DP]",
+            "master_class=1",
+            "master_addr=%d" % self.master_addr,
+            "",
+        ]
+
+        for index, sc in enumerate(json.loads(self.slave_configs)):
+            lines.append("[SLAVE_%d]" % index)
+            lines.append("name=%s" % sc.get("name", "slave_%d" % index))
+            lines.append("addr=%d" % int(sc["addr"]))
+            lines.append("gsd=%s" % self.write_gsd(temp_dir, index, sc))
+            lines.append("sync_mode=%d" % (1 if sc.get("sync_mode") else 0))
+            lines.append("freeze_mode=%d" % (1 if sc.get("freeze_mode") else 0))
+            lines.append("group_mask=%d" % int(sc.get("group_mask", 1)))
+            lines.append("watchdog_ms=%d" % int(sc.get("watchdog_ms", 5000)))
+            # Modules are only meaningful for a modular station, and have to be
+            # listed in slot order: pyprofibus feeds them to the gsd in the order
+            # of the module_N keys to build the cfg data elements.
+            for mod_index, module in enumerate(sc.get("modules", [])):
+                lines.append("module_%d=%s" % (mod_index, module))
+            lines.append("input_size=%d" % int(sc.get("input_size", 0)))
+            lines.append("output_size=%d" % int(sc.get("output_size", 0)))
+            lines.append("diag_period=%d" % int(sc.get("diag_period", 0)))
+            lines.append("")
+
+        path = os.path.join(temp_dir, "profibus.conf")
+        with open(path, "w") as f:
+            f.write("\n".join(lines))
+        return path
+
+    def write_gsd(self, temp_dir, index, slave_config):
+        """
+        Write the slave's gsd content out into temp_dir and return the path to hand to pyprofibus.
+        """
+        content = slave_config.get("gsd_file", "")
+        if not content.strip():
+            raise ValueError(
+                "slave_configs[%d] (addr %s) has no gsd_file. It carries the content of the "
+                "slave's gsd, which pyprofibus needs for the ident number, the Chk_Cfg data and "
+                "the User_Prm_Data - none of which can be derived from the sizes"
+                % (index, slave_config.get("addr"))
+            )
+        path = os.path.join(temp_dir, "slave_%d.gsd" % index)
+        with open(path, "w") as f:
+            f.write(content)
+        return path
 
     # ───────────── Poll Loop ─────────────
     def _poll_loop(self):
