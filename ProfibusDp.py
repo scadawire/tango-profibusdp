@@ -1,6 +1,8 @@
 # https://pypi.org/project/pyprofibus/
 
 import os
+import sys
+import time
 import json
 import shutil
 import struct
@@ -509,6 +511,126 @@ class ProfibusDp(Device, metaclass=DeviceMeta):
         }.get(name, AttrDataFormat.SCALAR)
 
 
+# ───────────── Device Scan ─────────────
+# "ProfibusDp --scan '<json>'" looks for stations instead of running the device server, so scadawire can
+# offer what it finds as a device to create. It prints one line, SCAN_RESULT_MARKER followed by
+# {"devices": [{"name", "properties", "details", "issues", "notes"}], "error"}: "properties" are named
+# like this driver's device properties, so a found bus is configured by copying them over. "issues" are
+# what speaks against using it, "notes" what has to be done before it works.
+SCAN_RESULT_MARKER = "SCADAWIRE_SCAN_RESULT "
+_HIGHEST_STATION = 125  # 126 is the default address of an unconfigured station, 127 broadcast
+
+
+def scan(config, phy=None):
+    """Builds the live list of the bus and identifies its DP slaves.
+
+    Every station address is asked for its FDL status, which every station answers with its type (slave,
+    or master in or out of the token ring). Each slave is then asked for its diagnosis, which carries its
+    ident number - the one thing that tells which gsd it needs - and the master that parameterized it.
+
+    This driver is the DP master of a whole bus, its slaves listed in slave_configs, so what is found is
+    offered as one device: the bus with every slave on it. The bus must not be in use by a running
+    master of this system meanwhile, and pyprofibus takes no part in a token ring, so a bus that has a
+    master of its own already is reported rather than offered quietly.
+    """
+    from pyprofibus.fdl import FdlTransceiver, FdlTelegram, FdlTelegram_FdlStat_Req
+    from pyprofibus.dp import DpTelegram, DpTelegram_SlaveDiag_Req, DpTelegram_SlaveDiag_Con
+    serial_port = str(config.get("serial_port") or "/dev/ttyUSB0")
+    baudrate = int(config.get("baudrate") or 19200)
+    master_addr = config.get("master_addr")
+    master_addr = 2 if master_addr in (None, "") else int(master_addr)
+    timeout = float(config.get("timeout") or 0.1)
+    ownPhy = phy is None
+    if ownPhy:
+        from pyprofibus.phy_serial import CpPhySerial
+        phy = CpPhySerial(port=serial_port)
+        phy.setConfig(baudrate=baudrate)
+    fdl = FdlTransceiver(phy)
+
+    def request(telegram, address, maxReplyLen):
+        # straight to the phy rather than through FdlTransceiver.send(), which passes no reply length:
+        # the phy then reserves the bus for a 255 octet reply, ~150ms a request at 19200 baud, and a
+        # request waiting for that is still queued when the scan has moved on to the next address.
+        # Neither telegram carries a frame count bit, which is all the transceiver would add.
+        phy.send(telegram, True, maxReplyLen)
+        # the wait covers the octets on the line too, 11 bits each, which is what a slow bus costs
+        deadline = time.time() + timeout + (maxReplyLen + 16) * 11.0 / baudrate
+        while time.time() < deadline:
+            ok, reply = fdl.poll(0.01)
+            if ok and reply is not None and reply.sa is not None \
+                    and (reply.sa & FdlTelegram.ADDRESS_MASK) == address:
+                return reply
+        return None
+
+    try:
+        stations = {}
+        for address in range(0, _HIGHEST_STATION + 1):
+            if address == master_addr:
+                continue
+            # the status reply is a fixed 6 octet telegram
+            reply = request(FdlTelegram_FdlStat_Req(da=address, sa=master_addr), address, 6)
+            if reply is not None:
+                stations[address] = reply.fc & FdlTelegram.FC_STYPE_MASK
+        slaves = []
+        for address in sorted(a for a, t in stations.items() if t == FdlTelegram.FC_SLAVE):
+            slave = {"addr": address, "ident_number": None, "locked_by_master": None}
+            # a diagnosis is 6 octets of data plus the header, some room left for extended diagnosis
+            reply = request(DpTelegram_SlaveDiag_Req(da=address, sa=master_addr).toFdlTelegram(), address, 64)
+            if reply is not None:
+                try:
+                    diag = DpTelegram.fromFdlTelegram(reply, thisIsMaster=True)
+                except Exception:
+                    diag = None
+                if isinstance(diag, DpTelegram_SlaveDiag_Con):
+                    slave["ident_number"] = "0x%04x" % diag.identNumber
+                    if diag.masterAddr not in (255, master_addr):
+                        slave["locked_by_master"] = diag.masterAddr
+            slaves.append(slave)
+        masters = sorted(a for a, t in stations.items() if t != FdlTelegram.FC_SLAVE)
+        if not slaves:
+            return {"devices": []}
+        issues = []
+        if masters:
+            issues.append("the bus has a master at address %s already, this driver takes no part in a token ring"
+                % ", ".join(str(m) for m in masters))
+        for slave in slaves:
+            if slave["locked_by_master"] is not None:
+                issues.append("slave %d is parameterized by the master at address %d"
+                    % (slave["addr"], slave["locked_by_master"]))
+            if slave["ident_number"] is None:
+                issues.append("slave %d did not answer its diagnosis request" % slave["addr"])
+        slaveConfigs = [{"addr": s["addr"], "name": "slave_%d" % s["addr"], "gsd_file": ""} for s in slaves]
+        return {"devices": [{
+            "name": "PROFIBUS DP bus on %s (%d slave%s)" % (serial_port, len(slaves), "" if len(slaves) == 1 else "s"),
+            "properties": {
+                "phy_type": "serial",
+                "serial_port": serial_port,
+                "baudrate": baudrate,
+                "master_addr": master_addr,
+                "slave_configs": json.dumps(slaveConfigs),
+            },
+            "details": {"slaves": slaves, "masters": masters},
+            "issues": issues,
+            "notes": ["every slave in slave_configs needs the content of its gsd file, the ident number tells which "
+                "one, and its modules and sizes before it works"],
+        }]}
+    finally:
+        if ownPhy:
+            phy.close()
+
+
+def scan_main(argv):
+    try:
+        config = json.loads(argv[argv.index("--scan") + 1]) if len(argv) > argv.index("--scan") + 1 else {}
+        result = scan(config)
+    except Exception as e:
+        result = {"devices": [], "error": "%s: %s" % (type(e).__name__, e)}
+    print(SCAN_RESULT_MARKER + json.dumps(result), flush=True)
+    return 1 if result.get("error") else 0
+
+
 if __name__ == "__main__":
+    if "--scan" in sys.argv:
+        sys.exit(scan_main(sys.argv))
     server_name = os.getenv("DEVICE_SERVER_NAME", "ProfibusDp")
     run({server_name: ProfibusDp})

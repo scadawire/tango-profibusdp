@@ -561,6 +561,126 @@ def test_edge_cases(s):
 #  Main
 # ===========================================================================
 
+# ===========================================================================
+#  Device scan
+# ===========================================================================
+
+def make_scan_phy(stations, baudrate=19200):
+    """A bus for the scan: a CpPhy whose stations answer with pyprofibus' own telegrams.
+
+    stations: address -> ("slave", ident number, master address it is locked to or 255) or ("master",).
+    An address not in it stays silent, as an empty address on a real bus.
+    """
+    from pyprofibus.phy import CpPhy
+    from pyprofibus.fdl import FdlTelegram, FdlTelegram_FdlStat_Con
+    from pyprofibus.dp import DpTelegram, DpTelegram_SlaveDiag_Req, DpTelegram_SlaveDiag_Con
+
+    class ScanPhy(CpPhy):
+        def __init__(self):
+            super().__init__()
+            self.queue = []
+            self.requests = []
+            self.closed = False
+
+        def sendData(self, telegramData, srd):
+            fdl = FdlTelegram.fromRawData(bytearray(telegramData))
+            address = fdl.da & FdlTelegram.ADDRESS_MASK
+            self.requests.append(address)
+            station = stations.get(address)
+            if station is None:
+                return
+            if (fdl.fc & FdlTelegram.FC_REQFUNC_MASK) == FdlTelegram.FC_FDL_STAT:
+                stype = FdlTelegram.FC_SLAVE if station[0] == "slave" else FdlTelegram.FC_MTR
+                self.queue.append(FdlTelegram_FdlStat_Con(da=fdl.sa, sa=address, fc=FdlTelegram.FC_OK | stype).getRawData())
+                return
+            dp = DpTelegram.fromFdlTelegram(fdl, thisIsMaster=False)
+            if station[0] == "slave" and DpTelegram_SlaveDiag_Req.checkType(dp):
+                con = DpTelegram_SlaveDiag_Con(da=fdl.sa, sa=address)
+                con.b1 |= DpTelegram_SlaveDiag_Con.B1_ONE
+                con.identNumber = station[1]
+                con.masterAddr = station[2]
+                self.queue.append(con.toFdlTelegram().getRawData())
+
+        def pollData(self, timeout=0.0):
+            return self.queue.pop(0) if self.queue else None
+
+        def close(self):
+            self.closed = True
+
+    phy = ScanPhy()
+    # as the scan configures its own phy: the bus time a request reserves follows the baudrate
+    phy.setConfig(baudrate=baudrate)
+    return phy
+
+
+def test_scan():
+    import json as _json
+    import ProfibusDp as module
+    print("\n-- scan --")
+    phy = make_scan_phy({8: ("slave", 0x80B2, 255), 12: ("slave", 0x00A1, 2)}, baudrate=187500)
+    result = module.scan({"serial_port": "/dev/ttyUSB1", "baudrate": 187500, "master_addr": 2, "timeout": 0.02}, phy=phy)
+    devices = result["devices"]
+    assert_equal("scan: every address but the master's is asked", sorted(set(phy.requests)) == [a for a in range(126) if a != 2], True)
+    assert_equal("scan: the bus is one device", len(devices), 1)
+    bus = devices[0]
+    assert_equal("scan: name", bus["name"], "PROFIBUS DP bus on /dev/ttyUSB1 (2 slaves)")
+    props = bus["properties"]
+    assert_equal("scan: bus properties", {k: props[k] for k in ("phy_type", "serial_port", "baudrate", "master_addr")},
+        {"phy_type": "serial", "serial_port": "/dev/ttyUSB1", "baudrate": 187500, "master_addr": 2})
+    assert_equal("scan: slave_configs is the json the property takes", _json.loads(props["slave_configs"]),
+        [{"addr": 8, "name": "slave_8", "gsd_file": ""}, {"addr": 12, "name": "slave_12", "gsd_file": ""}])
+    assert_equal("scan: ident numbers", [s["ident_number"] for s in bus["details"]["slaves"]], ["0x80b2", "0x00a1"])
+    assert_equal("scan: a slave locked to this master is fine", bus["issues"], [])
+    assert_equal("scan: the gsd is a note", len(bus["notes"]), 1)
+    assert_equal("scan: a passed in phy is not closed", phy.closed, False)
+
+
+def test_scan_reports_other_masters():
+    import ProfibusDp as module
+    result = module.scan({"master_addr": 3, "timeout": 0.02},
+        phy=make_scan_phy({1: ("master",), 8: ("slave", 0x80B2, 1)}))
+    bus = result["devices"][0]
+    assert_equal("scan: a master is not a slave", [s["addr"] for s in bus["details"]["slaves"]], [8])
+    assert_equal("scan: masters listed", bus["details"]["masters"], [1])
+    assert_equal("scan: another master and its lock are issues", len(bus["issues"]), 2)
+    assert_equal("scan: default port", bus["properties"]["serial_port"], "/dev/ttyUSB0")
+
+
+def test_scan_empty_bus():
+    import ProfibusDp as module
+    assert_equal("scan: nothing on the bus", module.scan({"timeout": 0.01}, phy=make_scan_phy({}))["devices"], [])
+    assert_equal("scan: masters alone are no bus to offer",
+        module.scan({"timeout": 0.01}, phy=make_scan_phy({1: ("master",)}))["devices"], [])
+
+
+def test_scan_main():
+    import io
+    import json as _json
+    import contextlib
+    import ProfibusDp as module
+    original = module.scan
+    try:
+        module.scan = lambda config: {"devices": [{"name": config["serial_port"]}]}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = module.scan_main(["ProfibusDp", "--scan", '{"serial_port": "/dev/ttyS2"}'])
+        assert_equal("scan main: exit code", code, 0)
+        assert_equal("scan main: result", _json.loads(out.getvalue().strip()[len(module.SCAN_RESULT_MARKER):]),
+            {"devices": [{"name": "/dev/ttyS2"}]})
+        def missing(config):
+            raise OSError("could not open port /dev/ttyS2")
+        module.scan = missing
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = module.scan_main(["ProfibusDp", "--scan", "{}"])
+        result = _json.loads(out.getvalue().strip()[len(module.SCAN_RESULT_MARKER):])
+        assert_equal("scan main: failure exit code", code, 1)
+        assert_equal("scan main: failure reported", result["error"], "OSError: could not open port /dev/ttyS2")
+    finally:
+        module.scan = original
+
+
+
 def main():
     global passed, failed
 
@@ -846,6 +966,12 @@ def main():
     test_edge_cases(s)
 
     run_simulator_tests()
+
+    print("\n== Device scan ==")
+    test_scan()
+    test_scan_reports_other_masters()
+    test_scan_empty_bus()
+    test_scan_main()
 
     total = passed + failed
     print(f"\n{'=' * 50}")
