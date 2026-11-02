@@ -542,9 +542,22 @@ def scan(config, phy=None):
     timeout = float(config.get("timeout") or 0.1)
     ownPhy = phy is None
     if ownPhy:
+        import termios
         from pyprofibus.phy_serial import CpPhySerial
-        phy = CpPhySerial(port=serial_port)
-        phy.setConfig(baudrate=baudrate)
+
+        def openPhy():
+            built = CpPhySerial(port=serial_port)
+            built.setConfig(baudrate=baudrate)
+            return built
+        try:
+            phy = openPhy()
+        except termios.error:
+            # a pty left at exactly these settings answers tcsetattr with EINVAL until they change -
+            # the device server of the line had it so. A real serial port never does this, every
+            # SITL and demo line is a pty; pyprofibus lets the termios error through unwrapped
+            import serial
+            serial.Serial(port=serial_port, baudrate=1200, parity="N", timeout=0).close()
+            phy = openPhy()
     fdl = FdlTransceiver(phy)
 
     def request(telegram, address, maxReplyLen):
